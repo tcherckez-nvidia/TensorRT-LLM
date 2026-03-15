@@ -410,7 +410,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             "nvidia/NVIDIA-Nemotron-3-Super-120B-FP8-FP8KV-012726"),
         "nvfp4":
         hf_id_to_local_model_dir(
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-012726"),
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"),
     }
 
     def get_default_sampling_params(self):
