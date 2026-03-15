@@ -2636,9 +2636,9 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
 class FuseNVFP4MoeConfig(TransformConfig):
     """Configuration for NVFP4 MoE fusion transform."""
 
-    backend: Literal["trtllm", "trtllm_gen"] = Field(
-        default="trtllm",
-        description="Backend to use for NVFP4 MoE computation ('trtllm' or 'trtllm_gen').",
+    backend: Literal["cutlass", "trtllm_gen"] = Field(
+        default="cutlass",
+        description="Backend to use for NVFP4 MoE computation ('cutlass' or 'trtllm_gen').",
     )
     allow_different_input_scales: bool = Field(
         default=False,
@@ -2678,8 +2678,9 @@ class FuseNVFP4Moe(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
+        ad_logger.info(f"FuseNVFP4Moe: backend={self.config.backend}")
         with cuda_memory_tracker():
-            if self.config.backend == "trtllm":
+            if self.config.backend == "cutlass":
                 fused_key_counter = _stack_nvfp4_cutlass_moe_weights(
                     gm,
                     allow_different_input_scales=self.config.allow_different_input_scales,
