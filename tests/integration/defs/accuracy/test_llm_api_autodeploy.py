@@ -409,8 +409,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         hf_id_to_local_model_dir(
             "nvidia/NVIDIA-Nemotron-3-Super-120B-FP8-FP8KV-012726"),
         "nvfp4":
-        hf_id_to_local_model_dir(
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"),
+        "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/autodeploy_data/hf_home/hub/models--nvidia--NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4/snapshots/167959da964ab08b30211f71e68f6670eaa87966",
     }
 
     def get_default_sampling_params(self):
