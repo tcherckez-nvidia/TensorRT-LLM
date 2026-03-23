@@ -1820,8 +1820,67 @@ def test_nvfp4_moe_ad_trtllm_gen_vs_cutlass_vs_reference(
     torch.manual_seed(1234)
     torch.cuda.manual_seed(1234)
 
-    # weight_std=0.05 targets ~1e-3 output magnitude for non-gated relu2 (where
-    # output ~ sqrt(I) * weight_std * relu2(sqrt(H) * weight_std^2) ~ 1.3e-3).
+    def _print_debug_tensors(
+        *,
+        label: str,
+        candidate: torch.Tensor,
+        reference: torch.Tensor,
+        atol_value: float,
+        rtol_value: float,
+    ) -> None:
+        candidate_f32 = candidate.detach().float().cpu()
+        reference_f32 = reference.detach().float().cpu()
+        diff = (candidate_f32 - reference_f32).abs()
+        topk = min(8, diff.numel())
+        topk_values, topk_indices = torch.topk(diff.reshape(-1), k=topk)
+        unravelled_indices = torch.unravel_index(topk_indices, diff.shape)
+        top_diffs = [
+            {
+                "index": tuple(int(dim[i]) for dim in unravelled_indices),
+                "candidate": float(candidate_f32.reshape(-1)[topk_indices[i]]),
+                "reference": float(reference_f32.reshape(-1)[topk_indices[i]]),
+                "abs_diff": float(topk_values[i]),
+            }
+            for i in range(topk)
+        ]
+        print(
+            f"{label} stats: "
+            f"candidate_max={candidate_f32.abs().max().item():.6e}, "
+            f"reference_max={reference_f32.abs().max().item():.6e}, "
+            f"candidate_mean={candidate_f32.mean().item():.6e}, "
+            f"reference_mean={reference_f32.mean().item():.6e}, "
+            f"max_abs_diff={diff.max().item():.6e}, "
+            f"mean_abs_diff={diff.mean().item():.6e}, "
+            f"atol={atol_value:.6e}, rtol={rtol_value}"
+        )
+        print(f"{label} top_abs_diffs={top_diffs}")
+
+    def _print_backend_samples(
+        *,
+        label: str,
+        baseline: torch.Tensor,
+        cutlass: torch.Tensor,
+        trtllm_gen: torch.Tensor | None = None,
+        num_items: int = 30,
+    ) -> None:
+        def _flatten_sample(tensor: torch.Tensor) -> list[float]:
+            flat = tensor.detach().float().reshape(-1).cpu()
+            return [float(value) for value in flat[:num_items]]
+
+        print(f"{label} baseline_first_{num_items}={_flatten_sample(baseline)}")
+        print(f"{label} cutlass_first_{num_items}={_flatten_sample(cutlass)}")
+        if trtllm_gen is not None:
+            print(f"{label} trtllm_gen_first_{num_items}={_flatten_sample(trtllm_gen)}")
+
+    # Empirically tune the test magnitudes so the baseline MoE outputs are around 1e-2
+    # across parameterizations without rescaling results after the fact.
+    test_magnitude = {
+        (True, 256): 0.07,
+        (True, 512): 0.0625,
+        (False, 256): 0.0625,
+        (False, 512): 0.0525,
+    }[(is_gated_mlp, hidden_size)]
+
     # The constructor calibrates w2_input_scale from the intermediate activation
     # (relu2 or SwiGLU) using ALL experts combined, matching real checkpoint behaviour
     # where all experts share a single w2 activation scale calibration.
@@ -1832,10 +1891,10 @@ def test_nvfp4_moe_ad_trtllm_gen_vs_cutlass_vs_reference(
         top_k=2,
         dtype=dtype,
         is_gated_mlp=is_gated_mlp,
-        weight_std=0.05,
+        weight_std=test_magnitude,
     ).to(device=device)
     # 16 tokens to ensure all experts fire; scale matches model calibration.
-    x = torch.randn(16, hidden_size, device=device, dtype=dtype) * 0.05
+    x = torch.randn(16, hidden_size, device=device, dtype=dtype) * test_magnitude
 
     gm = torch_export_to_gm(model, args=(x,), clone=True)
 
@@ -1885,13 +1944,28 @@ def test_nvfp4_moe_ad_trtllm_gen_vs_cutlass_vs_reference(
     atol = max(1e-5, rtol_cutlass * baseline_scale)
     atol_trtllm_gen = max(1e-5, rtol_trtllm_gen * baseline_scale)
 
-    torch.testing.assert_close(
-        output_cutlass,
-        output_baseline,
-        rtol=rtol_cutlass,
-        atol=atol,
-        msg="Cutlass fused MoE should match baseline within NVFP4 tolerance.",
-    )
+    try:
+        torch.testing.assert_close(
+            output_cutlass,
+            output_baseline,
+            rtol=rtol_cutlass,
+            atol=atol,
+            msg="Cutlass fused MoE should match baseline within NVFP4 tolerance.",
+        )
+    except AssertionError:
+        _print_debug_tensors(
+            label="Cutlass vs baseline",
+            candidate=output_cutlass,
+            reference=output_baseline,
+            atol_value=atol,
+            rtol_value=rtol_cutlass,
+        )
+        _print_backend_samples(
+            label="Cutlass failure samples",
+            baseline=output_baseline,
+            cutlass=output_cutlass,
+        )
+        raise
     if has_trtllm_gen:
         try:
             torch.testing.assert_close(
@@ -1905,6 +1979,19 @@ def test_nvfp4_moe_ad_trtllm_gen_vs_cutlass_vs_reference(
             diff = (output_trtllm_gen.detach().float() - output_baseline.detach().float()).abs()
             max_abs_diff = diff.max().item()
             mean_abs_diff = diff.mean().item()
+            _print_debug_tensors(
+                label="TRTLLM-Gen vs baseline",
+                candidate=output_trtllm_gen,
+                reference=output_baseline,
+                atol_value=atol_trtllm_gen,
+                rtol_value=rtol_trtllm_gen,
+            )
+            _print_backend_samples(
+                label="TRTLLM-Gen failure samples",
+                baseline=output_baseline,
+                cutlass=output_cutlass,
+                trtllm_gen=output_trtllm_gen,
+            )
             raise AssertionError(
                 f"{e}\n"
                 f"TRTLLM-Gen vs baseline: max_abs_diff={max_abs_diff:.6e}, mean_abs_diff={mean_abs_diff:.6e}, "

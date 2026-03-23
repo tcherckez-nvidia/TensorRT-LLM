@@ -2335,7 +2335,7 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
         result = torch.ops.trtllm.block_scale_interleave_reverse(scale_3d_u8.view(torch.uint8))
         return result.view(orig_dtype).contiguous()
 
-    def _shuffle_weight_stack(weight_3d: torch.Tensor, is_gated: bool) -> torch.Tensor:
+    def _shuffle_fc1_weight_stack(weight_3d: torch.Tensor, is_gated: bool) -> torch.Tensor:
         if weight_3d.numel() == 0:
             return weight_3d
         single_expert_weight = weight_3d[0]
@@ -2356,7 +2356,18 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
         # shuffle_matrix expects 2D, so use index_select instead of shuffle_matrix
         return torch.index_select(weight_3d, 1, permute)
 
-    def _shuffle_scale_stack(scale_3d_u8: torch.Tensor) -> torch.Tensor:
+    def _shuffle_fc2_weight_stack(weight_3d: torch.Tensor) -> torch.Tensor:
+        if weight_3d.numel() == 0:
+            return weight_3d
+        single_expert_weight = weight_3d[0]
+        permute = get_shuffle_matrix_a_row_indices(
+            single_expert_weight, epilogue_tile_m=EPILOGUE_TILE_M
+        )
+        if permute.device != single_expert_weight.device:
+            permute = permute.to(single_expert_weight.device)
+        return torch.index_select(weight_3d, 1, permute)
+
+    def _shuffle_fc1_scale_stack(scale_3d_u8: torch.Tensor, is_gated: bool) -> torch.Tensor:
         if scale_3d_u8.numel() == 0:
             return scale_3d_u8.view(torch.float8_e4m3fn)
         # Scales may be stored as float8_e4m3fn (load hook format); normalize to uint8
@@ -2372,23 +2383,59 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
                 f"K % {scale_k_alignment} == 0, but got {tuple(scale_3d_u8.shape)}."
             )
 
-        single_expert_scale = scale_3d_u8[0]
-        # Always apply gated-act gemm row reordering, matching the native _torch path
-        # which calls trtllmgen_maybe_get_cached_w3_w1_permute_indices with
-        # is_gated_act_gemm=True (the default) for both gated and non-gated models.
-        perm0 = get_reorder_rows_for_gated_act_gemm_row_indices(single_expert_scale.float()).to(
-            single_expert_scale.device
-        )
+        # permutation calculation functions only use the expert shape, it can be empty
+        dummy_single_expert_scale = scale_3d_u8[0]
+        if is_gated:
+            perm0 = get_reorder_rows_for_gated_act_gemm_row_indices(
+                dummy_single_expert_scale.float()
+            ).to(dummy_single_expert_scale.device)
+        else:
+            perm0 = torch.arange(
+                dummy_single_expert_scale.shape[0],
+                dtype=torch.long,
+                device=dummy_single_expert_scale.device,
+            )
         perm1 = get_shuffle_matrix_sf_a_row_indices(
-            single_expert_scale, epilogue_tile_m=EPILOGUE_TILE_M, num_elts_per_sf=num_elts_per_sf
+            dummy_single_expert_scale,
+            epilogue_tile_m=EPILOGUE_TILE_M,
+            num_elts_per_sf=num_elts_per_sf,
         )
-        if perm1.device != single_expert_scale.device:
-            perm1 = perm1.to(single_expert_scale.device)
+        if perm1.device != dummy_single_expert_scale.device:
+            perm1 = perm1.to(dummy_single_expert_scale.device)
         permute = perm0[perm1]
         shuffled = torch.index_select(scale_3d_u8, 1, permute)
         # block_scale_interleave does NOT support 3D [E, M, K] input correctly — it
         # flattens the whole tensor rather than interleaving each expert [M, K] independently.
         # Apply it per-expert to guarantee correct per-expert scale layout.
+        interleaved = torch.stack(
+            [torch.ops.trtllm.block_scale_interleave(shuffled[i]) for i in range(e_count)],
+            dim=0,
+        )
+        return interleaved.reshape(e_count, m_dim, k_dim).view(torch.float8_e4m3fn).contiguous()
+
+    def _shuffle_fc2_scale_stack(scale_3d_u8: torch.Tensor) -> torch.Tensor:
+        if scale_3d_u8.numel() == 0:
+            return scale_3d_u8.view(torch.float8_e4m3fn)
+        scale_3d_u8 = scale_3d_u8.view(torch.uint8)
+        num_elts_per_sf = 16
+        scale_k_alignment = 4
+        e_count, m_dim, k_dim = scale_3d_u8.shape
+        if m_dim % EPILOGUE_TILE_M != 0 or k_dim % scale_k_alignment != 0:
+            raise ValueError(
+                "TRTLLM-Gen NVFP4 fc2 scale shuffle requires the scale stack shape "
+                f"[E, M, K] to satisfy M % {EPILOGUE_TILE_M} == 0 and "
+                f"K % {scale_k_alignment} == 0, but got {tuple(scale_3d_u8.shape)}."
+            )
+
+        dummy_single_expert_scale = scale_3d_u8[0]
+        permute = get_shuffle_matrix_sf_a_row_indices(
+            dummy_single_expert_scale,
+            epilogue_tile_m=EPILOGUE_TILE_M,
+            num_elts_per_sf=num_elts_per_sf,
+        )
+        if permute.device != dummy_single_expert_scale.device:
+            permute = permute.to(dummy_single_expert_scale.device)
+        shuffled = torch.index_select(scale_3d_u8, 1, permute)
         interleaved = torch.stack(
             [torch.ops.trtllm.block_scale_interleave(shuffled[i]) for i in range(e_count)],
             dim=0,
@@ -2456,8 +2503,8 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
                 (0, (fc2_w_k_padded - fc2_w_k_dim) // 2, 0, fc2_w_n_padded - fc2_w_n_dim),
             )
 
-        fc1_shuffled = _shuffle_weight_stack(fc1_w_stacked, is_gated_mlp)
-        fc2_shuffled = _shuffle_weight_stack(fc2_w_stacked, is_gated_mlp)
+        fc1_shuffled = _shuffle_fc1_weight_stack(fc1_w_stacked, is_gated_mlp)
+        fc2_shuffled = _shuffle_fc2_weight_stack(fc2_w_stacked)
 
         # Block scales may be stored as float8_e4m3fn by the load hook; normalize to uint8
         # so that all downstream ops (pad, cat, reverse-interleave, shuffle) work correctly.
@@ -2523,8 +2570,8 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
             )
 
         try:
-            fc1_weight_blockscale = _shuffle_scale_stack(fc1_bs_u8)
-            fc2_weight_blockscale = _shuffle_scale_stack(fc2_bs_u8)
+            fc1_weight_blockscale = _shuffle_fc1_scale_stack(fc1_bs_u8, is_gated_mlp)
+            fc2_weight_blockscale = _shuffle_fc2_scale_stack(fc2_bs_u8)
         except ValueError as exc:
             ad_logger.debug_once(
                 f"Skip TRTLLM-Gen NVFP4 fusion: {exc}",
