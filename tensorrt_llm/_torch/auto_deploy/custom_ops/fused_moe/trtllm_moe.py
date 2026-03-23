@@ -13,13 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import (
     TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
 )
+from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
 from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import deserialize_mapping
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.modules.fused_moe.routing import RoutingMethodType
@@ -914,11 +915,71 @@ def trtllm_quant_finegrained_fp8_moe_fused_fake(
     return torch.empty_like(x)
 
 
+def _check_internal_routing_constraints(
+    router_logits: Optional[torch.Tensor],
+    routing_bias: Optional[torch.Tensor],
+    top_k: int,
+    n_group: int,
+    topk_group: int,
+    num_experts: int,
+) -> List[str]:
+    """Return a list of violated kernel constraints for internal routing."""
+    violations = []
+
+    if router_logits is None:
+        return ["router_logits not provided"]
+
+    if router_logits.dtype != torch.float32:
+        violations.append(
+            f"router_logits must be float32 for DeepSeekV3 routing, got {router_logits.dtype}"
+        )
+    if router_logits.dim() != 2:
+        violations.append(f"router_logits must be 2D, got {router_logits.dim()}D")
+    elif router_logits.shape[1] != num_experts:
+        violations.append(
+            f"router_logits.shape[1]={router_logits.shape[1]} must equal num_experts={num_experts}"
+        )
+
+    if routing_bias is not None:
+        if routing_bias.dim() != 1:
+            violations.append(f"routing_bias must be 1D, got {routing_bias.dim()}D")
+        elif routing_bias.shape[0] != num_experts:
+            violations.append(
+                f"routing_bias.shape[0]={routing_bias.shape[0]} must equal num_experts={num_experts}"
+            )
+
+    if top_k <= 0:
+        violations.append(f"top_k must be > 0, got {top_k}")
+    if num_experts % 4 != 0:
+        violations.append(f"num_experts={num_experts} must be divisible by 4")
+    if num_experts > 2048:
+        violations.append(f"num_experts={num_experts} must be <= 2048")
+    if num_experts <= top_k:
+        violations.append(f"num_experts={num_experts} must be > top_k={top_k}")
+
+    if n_group > 1:
+        if num_experts % n_group != 0:
+            violations.append(f"num_experts={num_experts} must be divisible by n_group={n_group}")
+        if not (0 < top_k <= 8):
+            violations.append(f"top_k={top_k} must be in (0, 8] when n_group > 1")
+        if not (0 < topk_group <= 4):
+            violations.append(f"topk_group={topk_group} must be in (0, 4] when n_group > 1")
+        if topk_group > n_group:
+            violations.append(f"topk_group={topk_group} must be <= n_group={n_group}")
+        if top_k >= topk_group * num_experts // n_group:
+            violations.append(
+                f"top_k={top_k} must be < topk_group * num_experts // n_group "
+                f"= {topk_group * num_experts // n_group}"
+            )
+
+    return violations
+
+
 @torch.library.custom_op("auto_deploy::trtllm_nvfp4_trtllm_gen_moe_fused", mutates_args=())
 def trtllm_nvfp4_trtllm_gen_moe_fused(
     x: torch.Tensor,
-    selected_experts: torch.Tensor,
-    routing_weights: torch.Tensor,
+    selected_experts: Optional[torch.Tensor],
+    routing_weights: Optional[torch.Tensor],
     fc1_expert_weights_fp4: torch.Tensor,
     fc2_expert_weights_fp4: torch.Tensor,
     fc1_weight_blockscale_fp8: torch.Tensor,
@@ -932,6 +993,12 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    router_logits: Optional[torch.Tensor] = None,
+    routing_bias: Optional[torch.Tensor] = None,
+    top_k: int = 0,
+    n_group: int = 1,
+    topk_group: int = 1,
+    routed_scaling_factor: float = 1.0,
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
 
@@ -951,14 +1018,41 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     else:
         raise ValueError(f"Unsupported activation '{ActivationType(act_fn).name}' for TRTLLM-Gen.")
 
-    top_k = int(routing_weights.shape[-1])
     num_experts = int(fc1_expert_weights_fp4.shape[0])
+    internal_routing_violations = _check_internal_routing_constraints(
+        router_logits, routing_bias, top_k, n_group, topk_group, num_experts
+    )
+    can_use_external = selected_experts is not None and routing_weights is not None
+
+    if not internal_routing_violations:
+        pass
+    elif can_use_external:
+        if router_logits is not None:
+            ad_logger.warning(
+                "Falling back to external routing due to constraint violations: "
+                f"{internal_routing_violations}"
+            )
+        router_logits = None
+        routing_bias = None
+        top_k = int(routing_weights.shape[-1])
+        n_group = 1
+        topk_group = 1
+        routed_scaling_factor = 1.0
+    else:
+        raise ValueError(
+            "No valid routing path: internal routing constraints not met and "
+            f"selected_experts/routing_weights are not provided. Violations: {internal_routing_violations}"
+        )
     factor = 1 if act_type == 1 else 2
     intermediate_size = int(fc1_expert_weights_fp4.shape[1] // factor)
     routing_method_type = int(RoutingMethodType.DeepSeekV3)
     mapping, enable_alltoall = _check_moe_alltoall(mapping_config, max_num_tokens)
 
     if enable_alltoall:
+        if router_logits is not None:
+            raise NotImplementedError(
+                "Internal routing is not supported with MoE all-to-all dispatch."
+            )
         final_hidden_states = _run_trtllm_gen_nvfp4_moe_with_alltoall(
             x=x2d,
             selected_experts=selected_experts.to(torch.int32),
@@ -983,9 +1077,13 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
         x2d, fc1_act_global_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False, False
     )
 
+    routing_bias_bf16 = None
+    if routing_bias is not None:
+        routing_bias_bf16 = routing_bias.to(torch.bfloat16).contiguous()
+
     outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
-        None,
-        None,
+        router_logits,
+        routing_bias_bf16,
         x_q_fp4,
         x_sf.view(torch.float8_e4m3fn),
         fc1_expert_weights_fp4,
@@ -1002,17 +1100,25 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
         fc2_alpha,
         num_experts,
         top_k,
-        1,
-        1,
+        n_group,
+        topk_group,
         intermediate_size,
         0,
         num_experts,
-        1.0,
+        routed_scaling_factor,
         routing_method_type,
         do_finalize=True,
         act_type=act_type,
-        topk_weights=routing_weights.to(torch.bfloat16),
-        topk_ids=selected_experts.to(torch.int32),
+        topk_weights=(
+            routing_weights.to(torch.bfloat16)
+            if router_logits is None and routing_weights is not None
+            else None
+        ),
+        topk_ids=(
+            selected_experts.to(torch.int32)
+            if router_logits is None and selected_experts is not None
+            else None
+        ),
     )
     final_hidden_states = outputs[0]
     if final_hidden_states.shape[1] > x_shape[-1]:
@@ -1023,8 +1129,8 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
 @trtllm_nvfp4_trtllm_gen_moe_fused.register_fake
 def trtllm_nvfp4_trtllm_gen_moe_fused_fake(
     x: torch.Tensor,
-    selected_experts: torch.Tensor,
-    routing_weights: torch.Tensor,
+    selected_experts: Optional[torch.Tensor],
+    routing_weights: Optional[torch.Tensor],
     fc1_expert_weights_fp4: torch.Tensor,
     fc2_expert_weights_fp4: torch.Tensor,
     fc1_weight_blockscale_fp8: torch.Tensor,
@@ -1038,5 +1144,11 @@ def trtllm_nvfp4_trtllm_gen_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    router_logits: Optional[torch.Tensor] = None,
+    routing_bias: Optional[torch.Tensor] = None,
+    top_k: int = 0,
+    n_group: int = 1,
+    topk_group: int = 1,
+    routed_scaling_factor: float = 1.0,
 ) -> torch.Tensor:
     return torch.empty_like(x)

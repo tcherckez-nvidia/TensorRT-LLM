@@ -2279,6 +2279,7 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
     gm: GraphModule,
     allow_different_input_scales: bool = False,
     reverse_interleaved_input_scales: bool = True,
+    use_internal_routing: bool = False,
 ) -> int:
     def _register_parameter(target, value):
         gm.register_parameter(target, torch.nn.Parameter(value, requires_grad=False))
@@ -2324,6 +2325,41 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
 
     def _round_up(x, alignment):
         return (x + alignment - 1) // alignment * alignment
+
+    def _extract_internal_routing_args(
+        selected_experts: Node,
+        routing_weights: Node,
+    ) -> Optional[dict]:
+        def _match_noaux_getitem(node: Node, expected_index: int) -> Optional[Node]:
+            if node.op != "call_function":
+                return None
+            if not hasattr(node.target, "__name__") or node.target.__name__ != "getitem":
+                return None
+            if len(node.args) < 2 or node.args[1] != expected_index:
+                return None
+            source_node = node.args[0]
+            if not isinstance(source_node, Node) or not is_op(
+                source_node, torch.ops.trtllm.noaux_tc_op
+            ):
+                return None
+            return source_node
+
+        indices_source = _match_noaux_getitem(selected_experts, expected_index=1)
+        weights_source = _match_noaux_getitem(routing_weights, expected_index=0)
+        if indices_source is None or weights_source is None or indices_source is not weights_source:
+            return None
+
+        if len(indices_source.args) < 6:
+            return None
+
+        return {
+            "router_logits": indices_source.args[0],
+            "routing_bias": indices_source.args[1],
+            "n_group": indices_source.args[2],
+            "topk_group": indices_source.args[3],
+            "top_k": indices_source.args[4],
+            "routed_scaling_factor": indices_source.args[5],
+        }
 
     EPILOGUE_TILE_M = 128
 
@@ -2468,6 +2504,11 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
             is_gated_mlp,
             act_fn,
         ) = _extract_op_args(node)
+        internal_routing_args = (
+            _extract_internal_routing_args(selected_experts, routing_weights)
+            if use_internal_routing
+            else None
+        )
 
         w1_stacked = _stack(w1_list, dim=0)
         w2_stacked = _stack(w2_list, dim=0)
@@ -2733,6 +2774,8 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
                     "act_fn": act_fn,
                 }
             )
+            if internal_routing_args is not None:
+                kwargs.update(internal_routing_args)
             new_node = graph.call_function(
                 replacement_op,
                 args=args,
@@ -2773,6 +2816,14 @@ class FuseNVFP4MoeConfig(TransformConfig):
             "before TRTLLM-Gen shuffle+interleave. Only used when backend='trtllm_gen'."
         ),
     )
+    use_internal_routing: bool = Field(
+        default=False,
+        description=(
+            "If True, detect DeepSeek-style `noaux_tc_op` routing feeding the NVFP4 MoE and pass "
+            "router logits/bias/group-topk metadata to the TRTLLM-Gen fused op so the kernel can "
+            "perform routing internally. If False, always use external selected_experts/routing_weights."
+        ),
+    )
 
 
 @TransformRegistry.register("fuse_nvfp4_moe")
@@ -2805,6 +2856,7 @@ class FuseNVFP4Moe(BaseTransform):
                     gm,
                     allow_different_input_scales=self.config.allow_different_input_scales,
                     reverse_interleaved_input_scales=self.config.reverse_interleaved_input_scales,
+                    use_internal_routing=self.config.use_internal_routing,
                 )
 
         info = TransformInfo(
