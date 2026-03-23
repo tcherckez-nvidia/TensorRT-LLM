@@ -499,7 +499,8 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     def get_default_sampling_params(self):
         eos_id = -1
         beam_width = 1
-        return SamplingParams(end_id=eos_id,
+        return SamplingParams(temperature=1.0,
+                              end_id=eos_id,
                               pad_id=eos_id,
                               n=beam_width,
                               use_beam_search=beam_width > 1)

@@ -2330,8 +2330,10 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
     def _reverse_interleave_scale_stack(scale_3d_u8: torch.Tensor) -> torch.Tensor:
         if scale_3d_u8.numel() == 0 or scale_3d_u8.shape[0] == 0:
             return scale_3d_u8
-        # block_scale_interleave_reverse supports 3D [E, rows, cols] directly.
-        return torch.ops.trtllm.block_scale_interleave_reverse(scale_3d_u8).contiguous()
+        # block_scale_interleave_reverse expects uint8; view to uint8 if stored as float8_e4m3fn.
+        orig_dtype = scale_3d_u8.dtype
+        result = torch.ops.trtllm.block_scale_interleave_reverse(scale_3d_u8.view(torch.uint8))
+        return result.view(orig_dtype).contiguous()
 
     def _shuffle_weight_stack(weight_3d: torch.Tensor, is_gated: bool) -> torch.Tensor:
         if weight_3d.numel() == 0:
@@ -2354,9 +2356,12 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
         # shuffle_matrix expects 2D, so use index_select instead of shuffle_matrix
         return torch.index_select(weight_3d, 1, permute)
 
-    def _shuffle_scale_stack(scale_3d_u8: torch.Tensor, is_gated: bool) -> torch.Tensor:
+    def _shuffle_scale_stack(scale_3d_u8: torch.Tensor) -> torch.Tensor:
         if scale_3d_u8.numel() == 0:
             return scale_3d_u8.view(torch.float8_e4m3fn)
+        # Scales may be stored as float8_e4m3fn (load hook format); normalize to uint8
+        # for ops that require it (get_shuffle_matrix_sf_a_row_indices, block_scale_interleave).
+        scale_3d_u8 = scale_3d_u8.view(torch.uint8)
         num_elts_per_sf = 16
         scale_k_alignment = 4
         e_count, m_dim, k_dim = scale_3d_u8.shape
@@ -2368,14 +2373,12 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
             )
 
         single_expert_scale = scale_3d_u8[0]
-        if is_gated:
-            perm0 = get_reorder_rows_for_gated_act_gemm_row_indices(single_expert_scale.float()).to(
-                single_expert_scale.device
-            )
-        else:
-            perm0 = torch.arange(
-                single_expert_scale.shape[0], dtype=torch.long, device=single_expert_scale.device
-            )
+        # Always apply gated-act gemm row reordering, matching the native _torch path
+        # which calls trtllmgen_maybe_get_cached_w3_w1_permute_indices with
+        # is_gated_act_gemm=True (the default) for both gated and non-gated models.
+        perm0 = get_reorder_rows_for_gated_act_gemm_row_indices(single_expert_scale.float()).to(
+            single_expert_scale.device
+        )
         perm1 = get_shuffle_matrix_sf_a_row_indices(
             single_expert_scale, epilogue_tile_m=EPILOGUE_TILE_M, num_elts_per_sf=num_elts_per_sf
         )
@@ -2383,7 +2386,13 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
             perm1 = perm1.to(single_expert_scale.device)
         permute = perm0[perm1]
         shuffled = torch.index_select(scale_3d_u8, 1, permute)
-        interleaved = torch.ops.trtllm.block_scale_interleave(shuffled)
+        # block_scale_interleave does NOT support 3D [E, M, K] input correctly — it
+        # flattens the whole tensor rather than interleaving each expert [M, K] independently.
+        # Apply it per-expert to guarantee correct per-expert scale layout.
+        interleaved = torch.stack(
+            [torch.ops.trtllm.block_scale_interleave(shuffled[i]) for i in range(e_count)],
+            dim=0,
+        )
         return interleaved.reshape(e_count, m_dim, k_dim).view(torch.float8_e4m3fn).contiguous()
 
     fused_key_counter = 0
@@ -2447,12 +2456,14 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
                 (0, (fc2_w_k_padded - fc2_w_k_dim) // 2, 0, fc2_w_n_padded - fc2_w_n_dim),
             )
 
-        fc1_shuffled = _shuffle_weight_stack(fc1_w_stacked, is_gated=is_gated_mlp)
-        fc2_shuffled = _shuffle_weight_stack(fc2_w_stacked, is_gated=False)
+        fc1_shuffled = _shuffle_weight_stack(fc1_w_stacked, is_gated_mlp)
+        fc2_shuffled = _shuffle_weight_stack(fc2_w_stacked, is_gated_mlp)
 
-        w1_bs_u8 = _stack(w1_weight_scale, dim=0)
-        w2_bs_u8 = _stack(w2_weight_scale, dim=0)
-        w3_bs_u8 = _stack(w3_weight_scale, dim=0, device=device, dtype=dtype)
+        # Block scales may be stored as float8_e4m3fn by the load hook; normalize to uint8
+        # so that all downstream ops (pad, cat, reverse-interleave, shuffle) work correctly.
+        w1_bs_u8 = _stack(w1_weight_scale, dim=0).view(torch.uint8)
+        w2_bs_u8 = _stack(w2_weight_scale, dim=0).view(torch.uint8)
+        w3_bs_u8 = _stack(w3_weight_scale, dim=0, device=device, dtype=dtype).view(torch.uint8)
 
         # Keep fusion conservative: if checkpoint scale layout does not match TRTLLM-Gen
         # kernel preconditions, skip and leave the safe per-expert path.
@@ -2512,8 +2523,8 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
             )
 
         try:
-            fc1_weight_blockscale = _shuffle_scale_stack(fc1_bs_u8, is_gated=is_gated_mlp)
-            fc2_weight_blockscale = _shuffle_scale_stack(fc2_bs_u8, is_gated=False)
+            fc1_weight_blockscale = _shuffle_scale_stack(fc1_bs_u8)
+            fc2_weight_blockscale = _shuffle_scale_stack(fc2_bs_u8)
         except ValueError as exc:
             ad_logger.debug_once(
                 f"Skip TRTLLM-Gen NVFP4 fusion: {exc}",
@@ -2533,8 +2544,15 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
         if is_gated_mlp:
             w3_scales_same = torch.all(w3_input_scale_stacked == w3_input_scale_stacked[0]).item()
             scales_same = w1_scales_same and w3_scales_same
+            # Also check that w1 and w3 have the same value (both branches share the same
+            # quantized input; using different scales requires min-based normalization).
+            w1_w3_equal = (
+                scales_same and torch.all(w1_input_scale_stacked == w3_input_scale_stacked).item()
+            )
+            all_scales_equal = w1_w3_equal
         else:
             scales_same = w1_scales_same
+            all_scales_equal = w1_scales_same
 
         if not scales_same:
             if not allow_different_input_scales:
@@ -2553,13 +2571,21 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
                     "Accuracy may suffer if scales differ significantly.",
                     key="trtllm_gen_nvfp4_moe_different_w1_w3_scales",
                 )
+        elif not all_scales_equal:
+            # scales_same=True (each is per-expert uniform) but w1 != w3 (gated MLP only).
+            # Use min to cover both branches safely without asserting.
+            ad_logger.debug_once(
+                "TRTLLM-Gen NVFP4 MoE: w1 and w3 input scales are uniform per expert but differ "
+                "from each other. Using min(w1, w3) for fc1_act_global.",
+                key="trtllm_gen_nvfp4_moe_w1_w3_scale_mismatch",
+            )
 
-        if scales_same:
+        if all_scales_equal:
             fc1_act_global = (
                 w1_input_scale_stacked[0].reshape(1).to(device=device, dtype=torch.float32)
             )
         else:
-            # allow_different_input_scales: use minimum (safe for quantizing shared input).
+            # Use minimum to cover both branches (handles per-expert variation and w1 != w3).
             if is_gated_mlp:
                 fc1_act_global = (
                     torch.minimum(w1_input_scale_stacked.min(), w3_input_scale_stacked.min())
@@ -2586,15 +2612,34 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
             ).to(dtype=torch.float32)
         else:
             up_alpha = gate_alpha
-        # Pass per-expert fc2_alpha directly (no global normalization). Normalizing by
-        # min(w2_input_scale) distorted logits for mixed-precision checkpoints where
-        # w2_input_scale varies across experts; the kernel expects raw per-expert alpha.
-        fc2_alpha = w2_alpha_stacked.to(device=device, dtype=torch.float32)
         if is_gated_mlp:
             # SwiGLU: scale_c folds fc2 input quant and up-branch dequant.
+            # Use per-expert w2_input_scale (all experts typically share the same
+            # calibration so this is effectively global).
             fc1_scale_c = (w2_input_scale_f32 * up_alpha).to(dtype=torch.float32)
+            # Pass per-expert fc2_alpha directly (no global normalization). Normalizing by
+            # min(w2_input_scale) distorted logits for mixed-precision checkpoints where
+            # w2_input_scale varies across experts; the kernel expects raw per-expert alpha.
+            fc2_alpha = w2_alpha_stacked.to(device=device, dtype=torch.float32)
         else:
-            fc1_scale_c = w2_input_scale_stacked.to(device=device, dtype=torch.float32)
+            # Non-gated relu2: use global minimum w2_input_scale as fc1_scale_c,
+            # matching the _torch module convention where fc31_scale_c is broadcast
+            # uniformly as fc2_input_scale = 2688/max_amax_relu2 = min(w2_input_scales).
+            # Per-expert variation in fc1_scale_c causes the trtllm_gen kernel to
+            # produce incorrect results for this activation type; using the global
+            # minimum is safe because it covers the widest dynamic range across experts.
+            global_w2_input_scale = (
+                w2_input_scale_stacked.min().reshape(1).to(device=device, dtype=torch.float32)
+            )
+            fc1_scale_c = global_w2_input_scale.expand(w2_input_scale_stacked.shape[0]).contiguous()
+            # Recompute fc2_alpha using the global scale so the dequantization is
+            # consistent: fc2_alpha[i] = w2_alpha[i] * w2_input_scale[i] / global
+            # (equivalent to 1/(global_w2_input_scale * w2_weight_scale_2[i])).
+            fc2_alpha = (
+                w2_alpha_stacked.to(device=device, dtype=torch.float32)
+                * w2_input_scale_stacked.to(device=device, dtype=torch.float32)
+                / global_w2_input_scale
+            )
         fc1_alpha = gate_alpha
 
         # Ensure kernel inputs are contiguous.
